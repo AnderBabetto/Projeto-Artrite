@@ -1,0 +1,1148 @@
+# %%
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt 
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, MinMaxScaler 
+from sklearn.metrics import classification_report, make_scorer, recall_score, roc_auc_score, confusion_matrix, ConfusionMatrixDisplay, roc_curve, auc, precision_score
+from imblearn.under_sampling import RandomUnderSampler
+from imblearn.over_sampling import SMOTE
+from collections import Counter
+from sklearn.naive_bayes import BernoulliNB
+from skopt import BayesSearchCV
+from skopt.space import Real 
+from sklearn.feature_selection import SelectKBest, f_classif 
+from sklearn.utils import resample # 🆕 Para o Bootstrap (IC)
+
+# =========================================================
+# 🚀 I. FUNÇÕES DE MÉTRICAS PERSONALIZADAS E ESTATÍSTICAS
+# =========================================================
+
+def calcular_phi(y_test, y_pred, y_proba):
+    """🧠 Calcula o Índice de Confiabilidade de Previsão (pHi)."""
+    if y_proba is None:
+        return np.nan
+    
+    # Probabilidade da classe predita
+    y_proba_completo = np.array([
+        y_proba[i] if y_pred[i] == 1 else (1 - y_proba[i]) 
+        for i in range(len(y_pred))
+    ])
+    
+    # Média das probabilidades APENAS nos acertos (y_pred == y_test)
+    acertos = (y_pred == y_test)
+    probabilidades_acertos = y_proba_completo[acertos]
+    phi = np.mean(probabilidades_acertos) if len(probabilidades_acertos) > 0 else 0
+    return phi
+
+def calcular_irpn(y_test, y_pred):
+    """🆕 Calcula o IRPN conforme solicitado: VP / (VP + FP)."""
+    cm = confusion_matrix(y_test, y_pred)
+    # cm é [[TN, FP], [FN, VP]]
+    FP = cm[0, 1]
+    VP = cm[1, 1]
+    
+    return VP / (VP + FP) if (VP + FP) != 0 else np.nan
+
+def calcular_intervalo_confianca_bootstrap(y_true, y_pred, metric_func, n_iterations=1000, alpha=0.95):
+    """📊 Calcula o Intervalo de Confiança (IC) por Bootstrap para métricas."""
+    stats = []
+    n_size = len(y_true)
+    indices = np.arange(n_size)
+    
+    for _ in range(n_iterations):
+        # Reamostragem com reposição
+        boot_indices = resample(indices, replace=True, n_samples=n_size)
+        
+        y_true_boot = y_true[boot_indices]
+        y_pred_boot = y_pred[boot_indices]
+        
+        # Ajuste para chamar a métrica corretamente (Recall exige pos_label)
+        if metric_func.__name__ == 'recall_score':
+             score = metric_func(y_true_boot, y_pred_boot, pos_label=1, zero_division=0)
+        else:
+             score = metric_func(y_true_boot, y_pred_boot)
+        stats.append(score)
+
+    stats = np.array(stats)
+    p_lower = (1.0 - alpha) / 2.0
+    lower_bound = np.quantile(stats, p_lower)
+    p_upper = alpha + p_lower
+    upper_bound = np.quantile(stats, p_upper)
+    
+    return lower_bound, upper_bound
+
+# =========================================================
+# 📈 II. FUNÇÃO PRINCIPAL DE AVALIAÇÃO GRÁFICA E MÉTRICA
+# =========================================================
+
+def avaliar_modelo_classificacao(y_test, y_pred, y_proba=None, model_name="Modelo de Classificação"):
+    """Executa a Matriz de Confusão, Curva ROC e calcula todas as métricas + IC."""
+    print(f"--- 11 & 12. Avaliação Final do Modelo: {model_name} ---")
+
+    # 1. Matriz de Confusão
+    print("\n[Gráfico 1] Plotando Matriz de Confusão...")
+    cm = confusion_matrix(y_test, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    plt.figure(figsize=(6, 6))
+    disp.plot(cmap=plt.cm.Blues, values_format='d') 
+    plt.title(f'Matriz de Confusão - {model_name}')
+    plt.show()
+    
+    # 2. Curva ROC e AUC
+    roc_auc = np.nan
+    if y_proba is not None and len(np.unique(y_test)) == 2: 
+        print("\n[Gráfico 2] Plotando Curva ROC...")
+        y_scores = y_proba
+        fpr, tpr, thresholds = roc_curve(y_test, y_scores)
+        roc_auc = auc(fpr, tpr)
+
+        plt.figure(figsize=(8, 8))
+        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'Curva ROC (AUC = {roc_auc:.2f})')
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Classificador Aleatório') 
+        plt.title(f'Curva ROC - {model_name}')
+        plt.legend(loc="lower right")
+        plt.show()
+        print(f"✅ Área Sob a Curva ROC (AUC): {roc_auc:.4f}")
+    
+    # 3. Métricas e Intervalo de Confiança (IC 95%)
+    print("\n--- Resultados Detalhados (IC 95% Bootstrap) ---")
+
+    
+    # pHi
+    phi = calcular_phi(y_test, y_pred, y_proba)
+    print(f"🧠 **pHi (Confiabilidade): {phi:.4f}**")
+    
+    # IRPN (Métrica Solicitada)
+    irpn = calcular_irpn(y_test, y_pred)
+    ic_irpn_low, ic_irpn_high = calcular_intervalo_confianca_bootstrap(y_test, y_pred, calcular_irpn)
+    print(f"🆕 **HIT (VP / (VP + FP)): {irpn:.4f}** (IC: [{ic_irpn_low:.4f}, {ic_irpn_high:.4f}])")
+    
+    print("-" * 50)
+    return roc_auc 
+
+# =========================================================
+
+# 🐜 III. SIMULAÇÃO MMAS (Feature Selection)
+# =========================================================
+def mmas_feature_selection(X, y, random_state=42):
+    """Simula a seleção de atributos pelo MMAS (SelectKBest)."""
+    k_features = int(X.shape[1] * 0.5) 
+    selector = SelectKBest(score_func=f_classif, k=k_features)
+    selector.fit(X, y)
+    selected_mask = selector.get_support(indices=True)
+    print(f" [MMAS Simulado/Ajustado] Selecionando {k_features} atributos.")
+    return selected_mask
+
+
+# =========================================================
+# ⚙️ IV. EXECUÇÃO DO FLUXO PRINCIPAL
+# =========================================================
+
+# --- VARIÁVEIS DE CONFIGURAÇÃO ---
+NOME_ARQUIVO_ENTRADA = "BaseFinal(v3).csv" 
+NOME_COLUNA_TARGET = 'TEM_ARTRITE' 
+# ---------------------------------
+
+try:
+    # 1. Carregamento e Divisão
+    print(f"--- 1. Carregando a Base de Dados: {NOME_ARQUIVO_ENTRADA} ---")
+    base = pd.read_csv(NOME_ARQUIVO_ENTRADA) 
+    X_prev = base.drop(columns=[NOME_COLUNA_TARGET])
+    y_classe = base[NOME_COLUNA_TARGET]
+    X_treino, X_teste, y_treino, y_teste = train_test_split(
+        X_prev, y_classe, test_size=0.2, random_state=42, stratify=y_classe 
+    )
+    y_teste_arr = y_teste.values # Convertido para array para uso consistente nas métricas
+    print(f"Classes Treino (Original): {Counter(y_treino)}")
+    print("-" * 50)
+
+    # 4. Pré-Processamento (Padronização)
+    print("--- 4. Aplicando Pré-Processamento (Padronização) ---")
+    scaler = StandardScaler()
+    X_treino_scaled = scaler.fit_transform(X_treino)
+    X_teste_scaled = scaler.transform(X_teste) 
+    X_treino_df = pd.DataFrame(X_treino_scaled, columns=X_treino.columns)
+    X_teste_df = pd.DataFrame(X_teste_scaled, columns=X_teste.columns)
+    y_treino = y_treino.reset_index(drop=True)
+    print("Padronização concluída.")
+    print("-" * 50)
+
+    # 5. Balanceamento Híbrido (RUS -> SMOTE)
+    print("--- 5. Balanceamento Híbrido (RUS 0.1 -> SMOTE) ---")
+    rus = RandomUnderSampler(sampling_strategy=0.1, random_state=42)
+    X_rus, y_rus = rus.fit_resample(X_treino_df, y_treino)
+    smote = SMOTE(random_state=42)
+    X_resampled, y_resampled = smote.fit_resample(X_rus, y_rus) 
+    print(f"Classes Treino (APÓS Híbrido): {Counter(y_resampled)}")
+    print("-" * 50)
+
+    # 6. Re-escalonamento (MinMaxScaler)
+    print("--- 6. Aplicando MinMax (Necessário para BernoulliNB) ---")
+    minmax_scaler = MinMaxScaler()
+    X_resampled_nb = minmax_scaler.fit_transform(X_resampled)
+    X_teste_nb = minmax_scaler.transform(X_teste_df) 
+    X_resampled_nb_df = pd.DataFrame(X_resampled_nb, columns=X_resampled.columns)
+    X_teste_nb_df = pd.DataFrame(X_teste_nb, columns=X_teste_df.columns)
+    print("Re-escalonamento MinMax concluído.")
+    print("-" * 50)
+
+    # 7. Seleção de Atributos com MMAS SIMULADO
+    print("--- 7. Seleção de Atributos com MMAS SIMULADO ---")
+    features_selected_indices = mmas_feature_selection(X=X_resampled_nb_df, y=y_resampled, random_state=42)
+    features_selecionadas = X_resampled_nb_df.columns[features_selected_indices].tolist()
+    print(f"Atributos Selecionados: {len(features_selecionadas)} de {X_resampled_nb_df.shape[1]}")
+    print("-" * 50)
+
+    # 8. FILTRAGEM DOS DATASETS
+    X_treino_final = X_resampled_nb_df[features_selecionadas]
+    X_teste_final = X_teste_nb_df[features_selecionadas]
+
+    # 9. Ajuste de Hiperparâmetros (BernoulliNB)
+    print("--- 9. Ajuste Automático de Hiperparâmetros (BernoulliNB) ---")
+    
+    # 🌟 CORREÇÃO: Usando booleanos (True/False), não strings.
+    search_spaces = {
+        'alpha': Real(1e-5, 1000.0, prior='log-uniform'), 
+        'fit_prior': [True, False]
+    }
+    
+    # Mantendo o scorer original (precision_score)
+    scorer = make_scorer(precision_score, pos_label=0) 
+
+    bayes_search = BayesSearchCV(
+        estimator=BernoulliNB(), search_spaces=search_spaces, n_iter=100, scoring=scorer, cv=10, n_jobs=-1, random_state=42, verbose=0
+    )
+    bayes_search.fit(X_treino_final, y_resampled) 
+    modelo_nb_best = bayes_search.best_estimator_
+
+    print(f"\n✅ Melhores Parâmetros (Precision) Encontrados: {bayes_search.best_params_}")
+    print(f"✅ Melhor Precision (Validação Cruzada): {bayes_search.best_score_:.4f}")
+    print("-" * 50)
+
+    # 10. Avaliação do Melhor Modelo no Teste
+    y_pred = modelo_nb_best.predict(X_teste_final)
+    y_pred_proba = modelo_nb_best.predict_proba(X_teste_final)[:, 1] 
+
+    print("Relatório de Classificação (Conjunto de Teste):")
+    print(classification_report(y_teste_arr, y_pred))
+    print("-" * 50)
+
+
+    # 11 & 12. Avaliação Gráfica e Métrica (Com as novas métricas e IC)
+    roc_auc = avaliar_modelo_classificacao(
+        y_test=y_teste_arr, 
+        y_pred=y_pred, 
+        y_proba=y_pred_proba, 
+        model_name="BernoulliNB Otimizado"
+    )
+
+    if not np.isnan(roc_auc):
+        print(f"Valor final do AUC: {roc_auc:.4f}")
+
+except FileNotFoundError:
+    print(f"❌ ERRO: O arquivo '{NOME_ARQUIVO_ENTRADA}' não foi encontrado. Certifique-se de que 'BaseFinal(v3).csv' está no diretório correto.")
+except ImportError as e:
+    print(f"❌ ERRO: Verifique se as bibliotecas necessárias (skopt, imblearn, etc.) estão instaladas. Erro: {e}")
+except Exception as e:
+    print(f"❌ Ocorreu um erro durante o processamento: {e}")
+
+# %%
+# =========================================================
+# 🚀 I. FUNÇÕES DE MÉTRICAS PERSONALIZADAS E ESTATÍSTICAS
+# 
+# ⚠️ NOTA: Essas funções devem ser definidas ANTES de serem chamadas.
+#          Se já estiverem no seu código principal, esta seção é redundante.
+# =========================================================
+
+def calcular_phi(y_test, y_pred, y_proba):
+    """🧠 Calcula o Índice de Confiabilidade de Previsão (pHi)."""
+    if y_proba is None or len(y_pred) != len(y_proba):
+        return np.nan
+    
+    # Probabilidade da classe predita
+    y_proba_completo = np.array([
+        y_proba[i] if y_pred[i] == 1 else (1 - y_proba[i]) 
+        for i in range(len(y_pred))
+    ])
+    
+    # Média das probabilidades APENAS nos acertos (y_pred == y_test)
+    acertos = (y_pred == y_test)
+    probabilidades_acertos = y_proba_completo[acertos]
+    phi = np.mean(probabilidades_acertos) if len(probabilidades_acertos) > 0 else 0
+    return phi
+
+def calcular_irpn(y_test, y_pred):
+    """🆕 Calcula o IRPN conforme solicitado: VP / (VP + FP)."""
+    cm = confusion_matrix(y_test, y_pred)
+    # cm é [[TN, FP], [FN, VP]]
+    FP = cm[0, 1]
+    VP = cm[1, 1]
+    
+    return VP / (VP + FP) if (VP + FP) != 0 else np.nan
+
+def calcular_intervalo_confianca_bootstrap(y_true, y_pred, metric_func, n_iterations=1000, alpha=0.95):
+    """📊 Calcula o Intervalo de Confiança (IC) por Bootstrap para métricas."""
+    stats = []
+    n_size = len(y_true)
+    indices = np.arange(n_size)
+    
+    for _ in range(n_iterations):
+        # Reamostragem com reposição
+        boot_indices = np.random.choice(indices, size=n_size, replace=True)
+        
+        y_true_boot = y_true[boot_indices]
+        y_pred_boot = y_pred[boot_indices]
+        
+        # Ajuste para chamar a métrica corretamente (Recall exige pos_label)
+        if metric_func.__name__ == 'recall_score':
+             score = metric_func(y_true_boot, y_pred_boot, pos_label=1, zero_division=0)
+        else:
+             score = metric_func(y_true_boot, y_pred_boot)
+        stats.append(score)
+
+    stats = np.array(stats)
+    p_lower = (1.0 - alpha) / 2.0
+    lower_bound = np.quantile(stats, p_lower)
+    p_upper = alpha + p_lower
+    upper_bound = np.quantile(stats, p_upper)
+    
+    return lower_bound, upper_bound
+
+def avaliar_modelo_classificacao(y_test, y_pred, y_proba=None, model_name="Modelo de Classificação"):
+    """Executa a Matriz de Confusão, Curva ROC e calcula todas as métricas + IC."""
+    print(f"\n" + "="*20 + " AVALIAÇÃO DO MODELO " + "="*20)
+    print(f"--- Modelo: {model_name} ---")
+
+    # Garante que y_test é um array numpy para bootstrap e consistência
+    y_test_arr = y_test.values if isinstance(y_test, pd.Series) else y_test
+
+    # 1. Matriz de Confusão
+    print("\n[Gráfico 1] Matriz de Confusão:")
+    cm = confusion_matrix(y_test_arr, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    plt.figure(figsize=(6, 6))
+    disp.plot(cmap=plt.cm.Purples, values_format='d') # Alterei a cor para combinar com o DT
+    plt.title(f'Matriz de Confusão - {model_name}')
+    plt.show()
+    
+    # 2. Curva ROC e AUC
+    roc_auc = np.nan
+    if y_proba is not None and len(np.unique(y_test_arr)) == 2: 
+        print("\n[Gráfico 2] Curva ROC:")
+        fpr, tpr, thresholds = roc_curve(y_test_arr, y_proba)
+        roc_auc = auc(fpr, tpr)
+
+        plt.figure(figsize=(8, 8))
+        plt.plot(fpr, tpr, color='purple', lw=2, label=f'Curva ROC (AUC = {roc_auc:.4f})')
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Aleatório (AUC = 0.5)')
+        plt.title(f'Curva ROC - {model_name}')
+        plt.legend(loc="lower right")
+        plt.show()
+        print(f"✅ Área Sob a Curva ROC (AUC): {roc_auc:.4f}")
+    
+    # 3. Métricas e Intervalo de Confiança (IC 95%)
+    print("\n--- Resultados Detalhados (IC 95% Bootstrap) ---")
+    
+    
+    # pHi
+    phi = calcular_phi(y_test_arr, y_pred, y_proba)
+    print(f"🧠 **pHi (Confiabilidade): {phi:.4f}**")
+    
+    # IRPN (Métrica Solicitada)
+    irpn = calcular_irpn(y_test_arr, y_pred)
+    ic_irpn_low, ic_irpn_high = calcular_intervalo_confianca_bootstrap(y_test_arr, y_pred, calcular_irpn)
+    print(f"🆕 **HIT (VP / (VP + VN)): {irpn:.4f}** (IC: [{ic_irpn_low:.4f}, {ic_irpn_high:.4f}])")
+    
+    print("=" * 60)
+    return roc_auc 
+
+# =========================================================
+# 🌳 Decision Tree Code Block (Decision Tree)
+# =========================================================
+
+# Importações necessárias para o novo bloco
+from sklearn.tree import DecisionTreeClassifier
+from skopt import BayesSearchCV
+from skopt.space import Integer, Categorical # Já importado, mas garantindo aqui
+from sklearn.metrics import recall_score, make_scorer, f1_score, roc_auc_score, confusion_matrix, ConfusionMatrixDisplay, roc_curve, classification_report
+from sklearn.tree import plot_tree # Nova importação necessária para plot_tree
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+
+# ⚠️ **IMPORTANTE:** O código abaixo assume que as variáveis abaixo estão definidas:
+# X_resampled, y_resampled, X_teste_df, y_teste, X_resampled.columns
+
+# Convertendo y_teste para numpy array, se for Series, para consistência com o restante do código
+y_teste_arr = y_teste.values if isinstance(y_teste, pd.Series) else y_teste
+
+
+# --------------------------------------------------------------------------------------
+# 17. Implementação da Árvore de Decisão (Decision Tree - DT) com BayesSearchCV
+# --------------------------------------------------------------------------------------
+
+print("\n" + "=" * 50)
+print("--- 17. Árvore de Decisão (DT) com BayesSearchCV e Precision ---")
+print("=" * 50)
+
+# 17.1. Definir o Espaço de Busca (Search Space) usando dimensões do skopt
+search_spaces_dt = {
+    # max_depth: Profundidade máxima, crucial para controlar o overfitting
+    'max_depth': [4,5],
+    # min_samples_split: Mínimo de amostras para dividir um nó
+    'min_samples_split': [2, 5, 10, 20],
+    # min_samples_leaf: Mínimo de amostras em um nó folha
+    'min_samples_leaf': [1, 2, 5, 10],
+        
+    'max_features': [None, 'sqrt', 'log2', 0.2, 0.4, 0.6, 0.8],
+    # criterion: Métrica de qualidade da divisão
+    'criterion': Categorical(['gini', 'entropy'])
+    # class_weight: A chave para lidar com o desbalanceamento
+}
+
+# 17.2. Definir a Métrica de Otimização (Precision para consistência com o NB)
+scorer_dt = make_scorer(precision_score, pos_label=0)
+
+# 17.3. Configurar e Rodar o BayesSearchCV
+dt_bayes_search = BayesSearchCV(
+    estimator=DecisionTreeClassifier(random_state=42),
+    search_spaces=search_spaces_dt,
+    n_iter=100,
+    scoring=scorer_dt,
+    cv=10,
+    n_jobs=-1,
+    random_state=42,
+    verbose=0
+)
+
+# Treinamento na base HÍBRIDA (balanceada e padronizada)
+dt_bayes_search.fit(X_resampled, y_resampled) 
+
+# 17.4. Extrair o Melhor Modelo e Parâmetros
+modelo_dt_best = dt_bayes_search.best_estimator_
+best_params_dt = dt_bayes_search.best_params_
+best_score_dt = dt_bayes_search.best_score_
+
+print(f"\n✅ Melhores Parâmetros DT (Precision) Encontrados: {best_params_dt}")
+print(f"✅ Melhor Precision (Validação Cruzada DT): {best_score_dt:.4f}")
+print("-" * 50)
+
+
+# 18. Avaliação do Decision Tree no Conjunto de Teste
+# Avalia usando o conjunto de TESTE (X_teste_df) PADRONIZADO
+y_pred_dt = modelo_dt_best.predict(X_teste_df)
+y_pred_proba_dt = modelo_dt_best.predict_proba(X_teste_df)[:, 1] 
+
+print("Relatório de Classificação DT no Conjunto de Teste (Desbalanceado):")
+print(classification_report(y_teste_arr, y_pred_dt))
+print("-" * 50)
+
+
+# 19. & 20. Avaliação Completa com Métricas e IC (Substitui os blocos 19 e 20)
+# Utilizamos a função 'avaliar_modelo_classificacao' para gerar gráficos e métricas
+roc_auc_dt_final = avaliar_modelo_classificacao(
+    y_test=y_teste_arr, 
+    y_pred=y_pred_dt, 
+    y_proba=y_pred_proba_dt, 
+    model_name="Decision Tree Otimizada"
+)
+print(f"Valor final do AUC da DT: {roc_auc_dt_final:.4f}")
+print("-" * 50)
+
+
+# 21. Gráfico Adicional: Visualização da Importância de Features
+print("\n--- 21. Plotando Importância de Features (Decision Tree) ---")
+
+importances = modelo_dt_best.feature_importances_
+feature_names = X_resampled.columns
+
+feature_importances_df = pd.DataFrame({
+    'Feature': feature_names,
+    'Importance': importances
+}).sort_values(by='Importance', ascending=False).head(15) 
+
+plt.figure(figsize=(12, 8))
+plt.barh(feature_importances_df['Feature'], feature_importances_df['Importance'], color='darkorchid')
+plt.xlabel("Importância de Feature")
+plt.ylabel("Features")
+plt.title("Top 15 Features Mais Importantes (Decision Tree)")
+plt.gca().invert_yaxis()
+plt.show()
+
+
+# 22. Plotagem da Árvore de Decisão (Visualização Detalhada)
+print("\n" + "=" * 50)
+print("--- 22. Plotagem da Árvore de Decisão ---")
+print("=" * 50)
+
+plt.figure(figsize=(30, 15)) 
+
+plot_tree(
+    modelo_dt_best, 
+    feature_names=feature_names.tolist(), 
+    class_names=['0 (Não)', '1 (Sim)'], 
+    filled=True, 
+    rounded=True, 
+    precision=2, 
+    fontsize=10
+)
+
+plt.title("Visualização Completa da Árvore de Decisão Otimizada", fontsize=18)
+plt.savefig('decision_tree_visualizacao.png') 
+print("✅ Gráfico da Árvore de Decisão salvo como 'decision_tree_visualizacao.png'")
+# plt.show() # Descomente para exibir em ambientes interativos
+
+# %%
+# =========================================================
+# 📦 0. IMPORTAÇÕES E FUNÇÕES DE CÁLCULO
+# =========================================================
+
+# Importações necessárias (Atualizadas)
+from sklearn.ensemble import ExtraTreesClassifier
+from skopt import BayesSearchCV
+from skopt.space import Integer, Categorical
+from sklearn.metrics import (
+    precision_score, make_scorer, f1_score, roc_auc_score, 
+    confusion_matrix, ConfusionMatrixDisplay, roc_curve, 
+    classification_report, auc, recall_score # Adicionado 'auc' e 'recall_score'
+) 
+from sklearn.utils import resample # Importa resample para o bootstrap
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+
+# --------------------------------------------------------------------------------------
+# 📈 I. FUNÇÕES DE CÁLCULO DE MÉTRICAS AVANÇADAS (pHI, HIT/IRPN, IC)
+# --------------------------------------------------------------------------------------
+
+def calcular_phi(y_test, y_pred, y_proba):
+    """🧠 Calcula o Índice de Confiabilidade de Previsão (pHi)."""
+    if y_proba is None:
+        return np.nan
+    
+    # y_proba é a probabilidade da CLASSE 1 (coluna 1).
+    # Obtemos a probabilidade da CLASSE PREDITA.
+    y_proba_predita = np.array([
+        y_proba[i] if y_pred[i] == 1 else (1 - y_proba[i]) 
+        for i in range(len(y_pred))
+    ])
+    
+    # Média das probabilidades APENAS nos acertos (y_pred == y_test)
+    acertos = (y_pred == y_test)
+    probabilidades_acertos = y_proba_predita[acertos]
+    phi = np.mean(probabilidades_acertos) if len(probabilidades_acertos) > 0 else 0
+    return phi
+
+def calcular_irpn(y_test, y_pred):
+    """🆕 Calcula o IRPN conforme solicitado: VP / (VP + FP)."""
+    cm = confusion_matrix(y_test, y_pred)
+    # cm é [[TN, FP], [FN, VP]]
+    FP = cm[0, 1]
+    VP = cm[1, 1]
+    
+    return VP / (VP + FP) if (VP + FP) != 0 else np.nan
+
+def calcular_intervalo_confianca_bootstrap(y_true, y_pred, metric_func, n_iterations=1000, alpha=0.95, y_proba=None):
+    """📊 Calcula o Intervalo de Confiança (IC) por Bootstrap para métricas."""
+    stats = []
+    n_size = len(y_true)
+    indices = np.arange(n_size)
+    
+    for _ in range(n_iterations):
+        # Reamostragem com reposição
+        boot_indices = resample(indices, replace=True, n_samples=n_size)
+        
+        y_true_boot = y_true[boot_indices]
+        y_pred_boot = y_pred[boot_indices]
+        
+        # Ajuste para chamar a métrica corretamente, incluindo pHi
+        if metric_func.__name__ == 'calcular_phi':
+            y_proba_boot = y_proba[boot_indices] if y_proba is not None else None
+            score = metric_func(y_true_boot, y_pred_boot, y_proba_boot)
+        elif metric_func.__name__ == 'recall_score':
+            score = recall_score(y_true_boot, y_pred_boot, pos_label=1, zero_division=0)
+        elif metric_func.__name__ == 'f1_score':
+            score = f1_score(y_true_boot, y_pred_boot, pos_label=1, zero_division=0)
+        else:
+            score = metric_func(y_true_boot, y_pred_boot)
+        
+        stats.append(score)
+
+    stats = np.array(stats)
+    p_lower = (1.0 - alpha) / 2.0
+    lower_bound = np.quantile(stats, p_lower)
+    p_upper = alpha + p_lower
+    upper_bound = np.quantile(stats, p_upper)
+    
+    return lower_bound, upper_bound
+
+# --------------------------------------------------------------------------------------
+# 📈 II. FUNÇÃO PRINCIPAL DE AVALIAÇÃO GRÁFICA E MÉTRICA
+# --------------------------------------------------------------------------------------
+
+def avaliar_modelo_classificacao(y_test, y_pred, y_proba=None, model_name="Modelo de Classificação"):
+    """Executa a Matriz de Confusão, Curva ROC e calcula todas as métricas + IC."""
+    print(f"\n" + "=" * 50)
+    print(f"--- Avaliação Final do Modelo: {model_name} ---")
+    print("=" * 50)
+
+    # 1. Relatório de Classificação (visão geral)
+    print("Relatório de Classificação (Métricas Padrão):")
+    print(classification_report(y_test, y_pred))
+    print("-" * 50)
+    
+    # 2. Matriz de Confusão
+    print("\n[Gráfico 1] Plotando Matriz de Confusão...")
+    cm = confusion_matrix(y_test, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    plt.figure(figsize=(6, 6))
+    disp.plot(cmap=plt.cm.Greens, values_format='d')
+    plt.title(f'Matriz de Confusão - {model_name}')
+    plt.show() # 
+    
+    # 3. Curva ROC e AUC
+    roc_auc = np.nan
+    if y_proba is not None and len(np.unique(y_test)) == 2: 
+        print("\n[Gráfico 2] Plotando Curva ROC...")
+        y_scores = y_proba
+        fpr, tpr, thresholds = roc_curve(y_test, y_scores)
+        roc_auc = auc(fpr, tpr) 
+
+        plt.figure(figsize=(8, 8))
+        plt.plot(fpr, tpr, color='green', lw=2, label=f'Curva ROC (AUC = {roc_auc:.4f})')
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Classificador Aleatório') 
+        plt.title(f'Curva ROC - {model_name}')
+        plt.legend(loc="lower right")
+        plt.grid(True)
+        plt.show() # 
+        print(f"✅ Área Sob a Curva ROC (AUC): {roc_auc:.4f}")
+    
+    # 4. Métricas Avançadas e Intervalo de Confiança (IC 95%)
+    print("\n--- Resultados de Confiabilidade e Customizados (IC 95% Bootstrap) ---")
+
+    # pHi (Confiabilidade/Confiança)
+    phi = calcular_phi(y_test, y_pred, y_proba)
+    # IC para pHi (passando y_proba para a função bootstrap)
+    ic_phi_low, ic_phi_high = calcular_intervalo_confianca_bootstrap(y_test, y_pred, calcular_phi, y_proba=y_proba)
+    print(f"🧠 **pHi (Confiabilidade): {phi:.4f}** (IC: [{ic_phi_low:.4f}, {ic_phi_high:.4f}])")
+    
+    # IRPN (HIT)
+    irpn = calcular_irpn(y_test, y_pred)
+    ic_irpn_low, ic_irpn_high = calcular_intervalo_confianca_bootstrap(y_test, y_pred, calcular_irpn)
+    print(f"🆕 **HIT (VP / (VP + VN)): {irpn:.4f}** (IC: [{ic_irpn_low:.4f}, {ic_irpn_high:.4f}])")
+    
+    print("-" * 50)
+    return roc_auc 
+
+
+# --------------------------------------------------------------------------------------
+# 17. Implementação da Extra Trees (ET) com BayesSearchCV
+# --------------------------------------------------------------------------------------
+
+print("\n" + "=" * 50)
+print("--- 17. Extra Trees (ET) com BayesSearchCV e F1-Score ---")
+print("=" * 50)
+
+# 17.1. Definir o Espaço de Busca (Search Space) - Adaptado para Extra Trees
+search_spaces_et = {
+    'n_estimators': [50, 75, 90, 100, 120],
+    'max_depth': [3, 4, 5, 7, 10], 
+    'min_samples_split': [2, 4, 7, 10, 12, 15, 17, 20],
+    'min_samples_leaf': [1, 2, 5, 7, 10],
+    'max_features': ['sqrt', 'log2', None, 0.8, 0.6, 0.4, 0.2],
+    'criterion': Categorical(['gini', 'entropy'])
+}
+
+# 17.2. Definir a Métrica de Otimização (F1-Score para equilíbrio)
+scorer_et = make_scorer(f1_score, pos_label=1) 
+
+# 17.3. Configurar e Rodar o BayesSearchCV
+et_bayes_search = BayesSearchCV(
+    estimator=ExtraTreesClassifier(random_state=42, class_weight='balanced'), 
+    search_spaces=search_spaces_et,
+    n_iter=100, 
+    scoring=scorer_et,
+    cv=10,
+    n_jobs=-1,
+    random_state=42,
+    verbose=1
+)
+
+# Treinamento na base HÍBRIDA (balanceada e padronizada)
+# ASSUME-SE QUE X_resampled E y_resampled ESTÃO DISPONÍVEIS
+try:
+    et_bayes_search.fit(X_resampled, y_resampled) 
+except NameError:
+    print("ERRO: As variáveis 'X_resampled' e 'y_resampled' não foram definidas. O treinamento não pode ser realizado.")
+    # Aqui o código pararia ou usaria dados fictícios de exemplo se fossem definidos
+    # Continue o fluxo se as variáveis estiverem definidas.
+    
+# 17.4. Extrair o Melhor Modelo e Parâmetros
+modelo_et_best = et_bayes_search.best_estimator_
+best_params_et = et_bayes_search.best_params_
+best_score_et = et_bayes_search.best_score_
+
+print(f"\n✅ Melhores Parâmetros ET (F1-Score) Encontrados: {best_params_et}")
+print(f"✅ Melhor F1-Score (Validação Cruzada ET): {best_score_et:.4f}")
+print("-" * 50)
+
+# --------------------------------------------------------------------------------------
+# 18. Avaliação do Extra Trees no Conjunto de Teste (CORRIGIDO)
+# --------------------------------------------------------------------------------------
+
+# 18.1. Previsões
+try:
+    y_pred_et = modelo_et_best.predict(X_teste_df)
+    y_pred_proba_et = modelo_et_best.predict_proba(X_teste_df)[:, 1] # Probabilidade da classe positiva (1)
+except NameError:
+    print("ERRO: As variáveis 'X_teste_df' e 'y_teste' não foram definidas. A avaliação não pode ser realizada.")
+    raise
+
+# >>> CORREÇÃO CRÍTICA: Converter para NumPy arrays antes de chamar a função de avaliação <<<
+# Isso garante que o indexador interno da função de bootstrap funcione corretamente (baseado em posição, e não em índice do Pandas).
+
+# Converte y_teste para array, se for uma Pandas Series.
+# A linha abaixo garante que mesmo que y_teste seja um array numpy, ele é mantido como um array.
+y_teste_arr = np.array(y_teste) if isinstance(y_teste, (pd.Series, pd.DataFrame)) else y_teste
+y_pred_et_arr = np.array(y_pred_et) # y_pred é geralmente um array numpy, mas garantimos
+y_pred_proba_et_arr = np.array(y_pred_proba_et) # Garante que as probabilidades são um array
+
+# 18.2. Chamada da Função de Avaliação
+# Use as variáveis convertidas.
+avaliar_modelo_classificacao(
+    y_test=y_teste_arr, 
+    y_pred=y_pred_et_arr, 
+    y_proba=y_pred_proba_et_arr, 
+    model_name="Extra Trees Otimizada"
+)
+
+
+# --------------------------------------------------------------------------------------
+# 21. Gráfico Adicional: Plotando Importância de Features (Extra Trees)
+# --------------------------------------------------------------------------------------
+
+print("\n" + "=" * 50)
+print("--- 21. Plotando Importância de Features (Extra Trees) ---")
+print("=" * 50)
+
+# Extra Trees, como um modelo de ensemble de árvores, possui Feature Importance
+importances_et = modelo_et_best.feature_importances_
+# ASSUME-SE QUE X_resampled ESTÁ DISPONÍVEL
+try:
+    feature_names = X_resampled.columns
+except AttributeError:
+    # Caso X_resampled seja um np.array e não um DataFrame
+    print("Aviso: 'X_resampled.columns' não está disponível. Usando índices numéricos para features.")
+    feature_names = [f'Feature {i}' for i in range(len(importances_et))]
+except NameError:
+    print("ERRO: Variável 'X_resampled' não foi definida. Não é possível calcular a importância das features.")
+    raise
+
+
+feature_importances_df_et = pd.DataFrame({
+    'Feature': feature_names,
+    'Importance': importances_et
+}).sort_values(by='Importance', ascending=False).head(15) 
+
+plt.figure(figsize=(12, 8))
+plt.barh(feature_importances_df_et['Feature'], feature_importances_df_et['Importance'], color='seagreen')
+plt.xlabel("Importância de Feature")
+plt.ylabel("Features")
+plt.title("Top 15 Features Mais Importantes (Extra Trees)")
+plt.gca().invert_yaxis()
+plt.show() #
+
+# %%
+# =========================================================
+# 📦 0. IMPORTAÇÕES E FUNÇÕES DE CÁLCULO
+# =========================================================
+
+# Importações necessárias (Atualizadas)
+from skopt import BayesSearchCV
+from skopt.space import Real, Integer, Categorical
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    make_scorer, f1_score, roc_auc_score, confusion_matrix, 
+    ConfusionMatrixDisplay, roc_curve, precision_score, 
+    classification_report, auc, recall_score # Adicionado 'auc', 'precision_score', 'classification_report', 'recall_score'
+) 
+from sklearn.utils import resample # Importa resample para o bootstrap
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+
+# --------------------------------------------------------------------------------------
+# 📈 I. FUNÇÕES DE CÁLCULO DE MÉTRICAS AVANÇADAS (pHI, HIT/IRPN, IC)
+# --------------------------------------------------------------------------------------
+
+def calcular_phi(y_test, y_pred, y_proba):
+    """🧠 Calcula o Índice de Confiabilidade de Previsão (pHi)."""
+    if y_proba is None:
+        return np.nan
+    
+    # y_proba é a probabilidade da CLASSE 1 (coluna 1).
+    # Obtemos a probabilidade da CLASSE PREDITA.
+    y_proba_predita = np.array([
+        y_proba[i] if y_pred[i] == 1 else (1 - y_proba[i]) 
+        for i in range(len(y_pred))
+    ])
+    
+    # Média das probabilidades APENAS nos acertos (y_pred == y_test)
+    acertos = (y_pred == y_test)
+    probabilidades_acertos = y_proba_predita[acertos]
+    phi = np.mean(probabilidades_acertos) if len(probabilidades_acertos) > 0 else 0
+    return phi
+
+def calcular_irpn(y_test, y_pred):
+    """🆕 Calcula o IRPN (HIT) conforme solicitado: VP / (VP + VN)."""
+    cm = confusion_matrix(y_test, y_pred)
+    # cm é [[TN, FP], [FN, VP]]
+    VN = cm[0, 0] 
+    VP = cm[1, 1] 
+    
+    return VP / (VP + VN) if (VP + VN) != 0 else np.nan
+
+def calcular_intervalo_confianca_bootstrap(y_true, y_pred, metric_func, n_iterations=1000, alpha=0.95, y_proba=None):
+    """📊 Calcula o Intervalo de Confiança (IC) por Bootstrap para métricas."""
+    stats = []
+    n_size = len(y_true)
+    indices = np.arange(n_size)
+    
+    for _ in range(n_iterations):
+        # Reamostragem com reposição
+        boot_indices = resample(indices, replace=True, n_samples=n_size)
+        
+        y_true_boot = y_true[boot_indices]
+        y_pred_boot = y_pred[boot_indices]
+        
+        # Ajuste para chamar a métrica corretamente, incluindo pHi
+        if metric_func.__name__ == 'calcular_phi':
+            y_proba_boot = y_proba[boot_indices] if y_proba is not None else None
+            score = metric_func(y_true_boot, y_pred_boot, y_proba_boot)
+        elif metric_func.__name__ == 'recall_score':
+            score = recall_score(y_true_boot, y_pred_boot, pos_label=1, zero_division=0)
+        elif metric_func.__name__ == 'f1_score':
+            score = f1_score(y_true_boot, y_pred_boot, pos_label=1, zero_division=0)
+        elif metric_func.__name__ == 'precision_score':
+            score = precision_score(y_true_boot, y_pred_boot, pos_label=1, zero_division=0)
+        else:
+            score = metric_func(y_true_boot, y_pred_boot)
+        
+        stats.append(score)
+
+    stats = np.array(stats)
+    p_lower = (1.0 - alpha) / 2.0
+    lower_bound = np.quantile(stats, p_lower)
+    p_upper = alpha + p_lower
+    upper_bound = np.quantile(stats, p_upper)
+    
+    return lower_bound, upper_bound
+
+# --------------------------------------------------------------------------------------
+# 📈 II. FUNÇÃO PRINCIPAL DE AVALIAÇÃO GRÁFICA E MÉTRICA
+# --------------------------------------------------------------------------------------
+
+def avaliar_modelo_classificacao(y_test, y_pred, y_proba=None, model_name="Modelo de Classificação"):
+    """Executa a Matriz de Confusão, Curva ROC e calcula todas as métricas + IC."""
+    print(f"\n" + "=" * 50)
+    print(f"--- Avaliação Final do Modelo: {model_name} ---")
+    print("=" * 50)
+
+    # 1. Relatório de Classificação (visão geral)
+    print("Relatório de Classificação (Métricas Padrão):")
+    print(classification_report(y_test, y_pred))
+    print("-" * 50)
+    
+    # 2. Matriz de Confusão
+    print("\n[Gráfico 1] Plotando Matriz de Confusão...")
+    cm = confusion_matrix(y_test, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    plt.figure(figsize=(6, 6))
+    disp.plot(cmap=plt.cm.Greens, values_format='d')
+    plt.title(f'Matriz de Confusão - {model_name}')
+    plt.show() 
+    
+    # 3. Curva ROC e AUC
+    roc_auc = np.nan
+    if y_proba is not None and len(np.unique(y_test)) == 2: 
+        print("\n[Gráfico 2] Plotando Curva ROC...")
+        y_scores = y_proba
+        fpr, tpr, thresholds = roc_curve(y_test, y_scores)
+        roc_auc = auc(fpr, tpr) 
+
+        plt.figure(figsize=(8, 8))
+        plt.plot(fpr, tpr, color='green', lw=2, label=f'Curva ROC (AUC = {roc_auc:.4f})')
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Classificador Aleatório') 
+        plt.title(f'Curva ROC - {model_name}')
+        plt.legend(loc="lower right")
+        plt.grid(True)
+        plt.show() 
+        print(f"✅ Área Sob a Curva ROC (AUC): {roc_auc:.4f}")
+    
+    # 4. Métricas Avançadas e Intervalo de Confiança (IC 95%)
+    print("\n--- Resultados de Confiabilidade e Customizados (IC 95% Bootstrap) ---")
+
+    # pHi (Confiabilidade/Confiança)
+    phi = calcular_phi(y_test, y_pred, y_proba)
+    # IC para pHi (passando y_proba para a função bootstrap)
+    ic_phi_low, ic_phi_high = calcular_intervalo_confianca_bootstrap(y_test, y_pred, calcular_phi, y_proba=y_proba)
+    print(f"🧠 **pHi (Confiabilidade): {phi:.4f}** (IC: [{ic_phi_low:.4f}, {ic_phi_high:.4f}])")
+    
+    # IRPN (HIT)
+    irpn = calcular_irpn(y_test, y_pred)
+    ic_irpn_low, ic_irpn_high = calcular_intervalo_confianca_bootstrap(y_test, y_pred, calcular_irpn)
+    print(f"🆕 **HIT (VP / (VP + VN)): {irpn:.4f}** (IC: [{ic_irpn_low:.4f}, {ic_irpn_high:.4f}])")
+    
+    print("-" * 50)
+    return roc_auc 
+
+
+# --------------------------------------------------------------------------------------
+# 11. Implementação do Random Forest (RF) com BayesSearchCV
+# --------------------------------------------------------------------------------------
+
+print("\n" + "=" * 50)
+print("--- 11. Random Forest (RF) Otimizado com class_weight='balanced' ---")
+print("=" * 50)
+
+# 11.1. Definir o Espaço de Busca
+search_spaces_rf = {
+    'n_estimators': [75, 90, 100, 120],
+    'max_depth': [4],
+    'min_samples_split': [10],
+    'min_samples_leaf': [2],
+    'max_features': [0.8],
+    'criterion': Categorical(['gini'])
+}
+
+# 11.2. Definir a Métrica de Otimização (Aqui, usa Precision)
+scorer_rf = make_scorer(precision_score, pos_label=1)
+
+# 11.3. Configurar e Rodar o BayesSearchCV
+rf_bayes_search = BayesSearchCV(
+    estimator=RandomForestClassifier(random_state=42, class_weight='balanced'),
+    search_spaces=search_spaces_rf,
+    
+    n_iter=100, 
+    scoring=scorer_rf,
+    
+    cv=10, 
+    n_jobs=5, 
+    random_state=42,
+    verbose=1 
+)
+
+# Treinamento na base HÍBRIDA (balanceada e padronizada)
+try:
+    rf_bayes_search.fit(X_resampled, y_resampled) 
+except NameError:
+    print("ERRO: As variáveis 'X_resampled' e 'y_resampled' não foram definidas. O treinamento não pode ser realizado.")
+    raise
+    
+# 11.4. Extrair o Melhor Modelo e Parâmetros
+modelo_rf_best = rf_bayes_search.best_estimator_
+best_params_rf = rf_bayes_search.best_params_
+best_score_rf = rf_bayes_search.best_score_
+
+print(f"\n✅ Melhores Parâmetros RF (Precision) Encontrados: {best_params_rf}")
+print(f"✅ Melhor Precision (Validação Cruzada): {best_score_rf:.4f}")
+print("-" * 50)
+
+# --------------------------------------------------------------------------------------
+# 12. Avaliação do Random Forest no Conjunto de Teste (NOVO: PREPARAÇÃO PARA FUNÇÃO)
+# --------------------------------------------------------------------------------------
+
+# 12.1. Previsões
+try:
+    y_pred_rf = modelo_rf_best.predict(X_teste_df)
+    y_pred_proba_rf = modelo_rf_best.predict_proba(X_teste_df)[:, 1] # Probabilidade da classe positiva (1)
+    
+    # >>> CORREÇÃO CRÍTICA: Converter para NumPy arrays para evitar KeyError no Bootstrap <<<
+    y_teste_arr = np.array(y_teste) if isinstance(y_teste, (pd.Series, pd.DataFrame)) else y_teste
+    y_pred_rf_arr = np.array(y_pred_rf)
+    y_pred_proba_rf_arr = np.array(y_pred_proba_rf)
+    
+except NameError:
+    print("ERRO: As variáveis 'X_teste_df' e 'y_teste' não foram definidas. A avaliação não pode ser realizada.")
+    raise
+
+# 12.2. Chamada da Função de Avaliação (Substitui Blocos 12, 13 e 14)
+# Esta função executa a avaliação completa, incluindo Relatório, Matriz de Confusão, ROC, pHi e HIT.
+avaliar_modelo_classificacao(
+    y_test=y_teste_arr, 
+    y_pred=y_pred_rf_arr, 
+    y_proba=y_pred_proba_rf_arr, 
+    model_name="Random Forest Otimizado"
+)
+
+# --------------------------------------------------------------------------------------
+# 15. Gráfico Adicional: Importância de Features (Random Forest)
+# --------------------------------------------------------------------------------------
+
+print("\n" + "=" * 50)
+print("--- 15. Plotando Importância de Features (Random Forest) ---")
+print("=" * 50)
+
+# 15.1. Extrair as importâncias e os nomes das features
+importances = modelo_rf_best.feature_importances_
+
+# ASSUME-SE QUE X_resampled ESTÁ DISPONÍVEL
+try:
+    feature_names = X_resampled.columns 
+except AttributeError:
+    print("Aviso: 'X_resampled.columns' não está disponível. Usando índices numéricos para features.")
+    feature_names = [f'Feature {i}' for i in range(len(importances))]
+except NameError:
+    print("ERRO: Variável 'X_resampled' não foi definida. Não é possível calcular a importância das features.")
+    raise
+
+
+# Cria um DataFrame para fácil visualização e ordenação
+feature_importances_df = pd.DataFrame({
+    'Feature': feature_names,
+    'Importance': importances
+}).sort_values(by='Importance', ascending=False).head(20)
+
+# 15.2. Plotagem
+plt.figure(figsize=(12, 8))
+plt.barh(feature_importances_df['Feature'], feature_importances_df['Importance'], color='teal')
+plt.xlabel("Importância de Feature (MDI)")
+plt.ylabel("Features")
+plt.title("Top 20 Features Mais Importantes (Random Forest)")
+plt.gca().invert_yaxis() 
+plt.show() 
+
+# ----------------------------------------------------------------------
+# 16. Otimização do Threshold (Ajuste da Fronteira)
+# ----------------------------------------------------------------------
+print("\n" + "=" * 50)
+print("--- 16. Otimização do Threshold (Ajuste da Fronteira) ---")
+print("=" * 50)
+
+# Usa as probabilidades já convertidas para array
+y_proba = y_pred_proba_rf_arr 
+y_teste_t = y_teste_arr # Usa o array de y_teste
+
+best_threshold = 0.8
+best_f1_score = 0
+best_recall_0 = 0
+
+# Testar thresholds de 0.01 até 0.5 com passos de 0.01 (Foco na classe 0)
+thresholds = np.arange(0.01, 0.51, 0.01) 
+
+for t in thresholds:
+    # Previsão binária usando o novo threshold
+    y_pred_t = (y_proba > t).astype(int)
+    
+    # Calcular o F1-Score da Classe 1
+    f1_t = f1_score(y_teste_t, y_pred_t, pos_label=1, zero_division=0)
+    
+    # Calcular o Recall da Classe 0
+    cm_t = confusion_matrix(y_teste_t, y_pred_t)
+    # A soma da linha 0 (True Negatives + False Positives) é o total da classe 0.
+    total_class_0 = cm_t[0].sum()
+    recall_0_t = cm_t[0, 0] / total_class_0 if total_class_0 != 0 else 0
+    
+    # Objetivo: Maximizamos o Recall da Classe 0 E o F1-score da Classe 1
+    if recall_0_t > best_recall_0:
+        best_recall_0 = recall_0_t
+        best_threshold = t
+        best_f1_score = f1_t 
+
+print(f"Melhor Threshold (Priorizando Recall da Classe 0): {best_threshold:.2f}")
+print(f"Recall da Classe 0 com esse Threshold: {best_recall_0:.2f}")
+print(f"F1-Score da Classe 1 com esse Threshold: {best_f1_score:.4f}")
+
+# Re-avaliar o modelo usando o Threshold Otimizado
+y_pred_final = (y_proba > best_threshold).astype(int)
+
+print("\n--- Relatório de Classificação (Threshold Ajustado) ---")
+# Usa o y_teste array para o relatório final
+print(classification_report(y_teste_t, y_pred_final))
+
+# %%
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt 
+import seaborn as sns 
+from sklearn.manifold import TSNE 
+# ... (outras importações)
+
+# ... (Seu código de setup e variáveis de configuração) ...
+
+try:
+    # 1. Carregamento, 2. Definição de Features/Target e 3. Divisão em Treino/Teste
+    print(f"--- 1. Carregando a Base de Dados: {NOME_ARQUIVO_ENTRADA} ---")
+    base = pd.read_csv(NOME_ARQUIVO_ENTRADA) 
+    X_prev = base.drop(columns=[NOME_COLUNA_TARGET])
+    y_classe = base[NOME_COLUNA_TARGET]
+    
+    # Faz a divisão para ter o X_treino e y_treino ANTES de tudo
+    X_treino, X_teste, y_treino, y_teste = train_test_split(
+        X_prev, y_classe, test_size=0.20, random_state=42, stratify=y_classe 
+    )
+    # Resetando índice do Y de treino para plotagem
+    y_treino_tsne = y_treino.reset_index(drop=True) 
+    print("-" * 50)
+    
+    # ----------------------------------------------------------------------------------
+    # 🆕 ETAPA 0: Visualização com t-SNE no Conjunto de TREINO Original 
+    # ----------------------------------------------------------------------------------
+    print("--- 0. Visualização (t-SNE) no Conjunto de TREINO Original ---")
+    
+    # --- Bloco de Inicialização TSNE (Compatibilidade de Versão) ---
+    try:
+        # Tentativa 1: Convenção moderna (pode ser o seu caso)
+        tsne = TSNE(n_components=2, random_state=42, perplexity=30, max_iter=1000, learning_rate='auto')
+    except TypeError:
+        # Tentativa 2: Convenção mais antiga (se 'learning_rate' ou 'max_iter' falhar)
+        print("Aviso: Tentando inicialização TSNE com convenção de parâmetros mais antiga.")
+        tsne = TSNE(n_components=2, random_state=42, perplexity=30, n_iter=1000) 
+    except Exception:
+        # Tentativa 3: Inicialização minimalista (para versões muito antigas)
+        print("Aviso: Revertendo para inicialização TSNE minimalista.")
+        tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+    # ---------------------------------------------------------------
+        
+    # 🎯 AQUI ESTÁ A MUDANÇA: Usa X_treino
+    X_treino_tsne = tsne.fit_transform(X_treino)
+    
+    # Cria um DataFrame para plotar
+    tsne_df = pd.DataFrame(data = X_treino_tsne, columns = ['Dimensão 1', 'Dimensão 2'])
+    # 🎯 AQUI ESTÁ A MUDANÇA: Usa y_treino_tsne
+    tsne_df['TEM_ARTRITE'] = y_treino_tsne.astype(str)
+    
+    # Plotagem
+    plt.figure(figsize=(10, 8))
+    sns.scatterplot(
+        x="Dimensão 1", y="Dimensão 2",
+        hue="TEM_ARTRITE",
+        palette=sns.color_palette("deep", 2), 
+        data=tsne_df,
+        legend="full",
+        alpha=0.8
+    )
+    plt.title('t-SNE do Conjunto de Treino')
+    plt.grid(True)
+    plt.show()
+
+    print("t-SNE concluído. Verifique o gráfico para ver a separação das classes.")
+    print("-" * 50)
+    
+    # Continua com a Etapa 4 (Padronização)
+    # ... (Seu código da Etapa 4 em diante - Sem alterações) ...
+  
+except FileNotFoundError:
+    print(f"❌ ERRO: O arquivo '{NOME_ARQUIVO_ENTRADA}' não foi encontrado.")
+except ImportError as e:
+    if 'skopt' in str(e):
+          print("❌ ERRO: A biblioteca 'scikit-optimize (skopt)' não está instalada. Execute: pip install scikit-optimize")
+    elif 'seaborn' in str(e):
+          print("❌ ERRO: A biblioteca 'seaborn' não está instalada. Execute: pip install seaborn")
+    else:
+          print(f"❌ ERRO: Verifique se todas as bibliotecas estão instaladas. Erro: {e}")
+except Exception as e:
+    print(f"❌ Ocorreu um erro durante o processamento: {e}")
+
+
