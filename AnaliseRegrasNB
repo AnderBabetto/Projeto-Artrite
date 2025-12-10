@@ -293,3 +293,32 @@ except ImportError as e:
 except Exception as e:
     print(f"❌ Ocorreu um erro durante o processamento: {e}")
 \\
+
+
+--- 13. Interpretabilidade: Fatores de Risco e Proteção (Log-Odds Ratio) ---
+
+🎯 TOP 10 FATORES DE RISCO (Log-Odds Alto e Positivo) para Artrite:
+            Feature  Log_Odds_Ratio
+0    OUTRAS_DOENÇAS       14.896636
+1     TEM_DEPRESSÃO        0.204804
+2      REFRIGERANTE        0.041396
+3               IMC       -0.012420
+4              SUCO       -0.015304
+5            FEIJÃO       -0.025979
+6             CARNE       -0.029514
+7  DESLOCAMENTO_VZS       -0.055823
+8             FRUTA       -0.085594
+9          BISCOITO       -0.086389
+
+🛡️ TOP 10 FATORES DE PROTEÇÃO (Log-Odds Baixo e Negativo) contra Artrite:
+             Feature  Log_Odds_Ratio
+2       REFRIGERANTE        0.041396
+3                IMC       -0.012420
+4               SUCO       -0.015304
+5             FEIJÃO       -0.025979
+6              CARNE       -0.029514
+7   DESLOCAMENTO_VZS       -0.055823
+8              FRUTA       -0.085594
+9           BISCOITO       -0.086389
+10             IDADE       -0.264848
+11              SEXO       -0.493384
